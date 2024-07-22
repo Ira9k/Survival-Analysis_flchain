@@ -1,0 +1,596 @@
+---
+title: "Ανάλυση του Dataset flchain"
+author: "Σπυριδούλα Ήρα Καρνιάκ"
+date: "2024-05-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Εγκατάσταση και φόρτωση απαραίτητων πακέτων
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(TH.data, survminer, survival, tinytex, knitr, bookdown, kableExtra, ggplot2, mice, dplyr, rms)
+
+# Γενική συνάρτηση για φόρτωση και προεπεξεργασία δεδομένων
+load_and_preprocess_data <- function(dataset_name, package_name) {
+  data(dataset_name, package = package_name)
+  df <- get(dataset_name)
+  
+  # Αφαίρεση τιμών όπου futime == 0
+  df <- subset(df, futime != 0)
+  
+  return(df)
+}
+
+# Συνάρτηση για ανάλυση κατηγορικών μεταβλητών
+analyze_categorical_vars <- function(df) {
+  cat_vars <- names(df)[sapply(df, function(x) is.factor(x) || is.character(x))]
+  cat_levels <- lapply(df[cat_vars], unique)
+  return(cat_levels)
+}
+
+# Συνάρτηση για ανάλυση μεταβλητών και επιπέδων
+analyze_vars <- function(df) {
+  all_vars <- names(df)
+  var_levels <- lapply(df, function(x) if (is.factor(x) || is.character(x) || is.numeric(x)) unique(x) else NULL)
+  names(var_levels) <- all_vars
+  return(var_levels)
+}
+
+# Συνάρτηση για τον υπολογισμό και την εκτύπωση των κενών τιμών σε κάθε μεταβλητή
+missing_values_summary <- function(df) {
+  # Υπολογισμός του αριθμού των κενών τιμών για κάθε μεταβλητή
+  missing_summary <- sapply(df, function(x) sum(is.na(x)))
+  
+  # Δημιουργία ενός πίνακα με τα αποτελέσματα
+  missing_table <- data.frame(Variable = names(missing_summary), MissingCount = missing_summary)
+  
+  # Φιλτράρισμα για να εμφανιστούν μόνο οι μεταβλητές με κενές τιμές
+  missing_table <- missing_table[missing_table$MissingCount > 0, ]
+  
+  # Εκτύπωση των αποτελεσμάτων
+  if (nrow(missing_table) > 0) {
+    print(kable(missing_table, caption = "Αριθμός Κενών Τιμών ανά Μεταβλητή"))
+  } else {
+    print("Δεν υπάρχουν κενές τιμές στο dataset.")
+  }
+}
+
+# Συνάρτηση για την εμφάνιση ποσοστών ανδρών και γυναικών
+plot_gender_distribution <- function(df) {
+  percentage_male <- sum(df$sex == "M") / nrow(df) * 100
+  percentage_female <- sum(df$sex == "F") / nrow(df) * 100
+  
+  barplot(c(percentage_male, percentage_female), 
+          names.arg = c("Men", "Women"), 
+          ylab = "Percentage (%)",
+          main = "Percentage of Men and Women in the Sample",
+          border = "blue", 
+          width = 0.8,
+          ylim = c(0, max(c(percentage_male, percentage_female)) * 1.1), 
+          col = "lightblue" 
+          )
+}
+
+# Συνάρτηση για την εκτύπωση επιβιωσάντων και θανόντων
+print_survivors_deceased <- function(df) {
+  survivors <- subset(df, death == 0)
+  deceased <- subset(df, death == 1)
+  
+  return(list(survivors = survivors, deceased = deceased))
+}
+
+# Συνάρτηση για τη δημιουργία ιστογραμμάτων
+plot_histograms <- function(survivors, deceased, var, fill_surv, fill_dec, binwidth, title) {
+  ggplot() +
+    geom_histogram(data = survivors, aes_string(x = var), fill = fill_surv, color = "black", alpha = 0.5, binwidth = binwidth) +
+    geom_histogram(data = deceased, aes_string(x = var), fill = fill_dec, color = "black", alpha = 0.5, binwidth = binwidth) +
+    labs(title = title, x = var, y = "Frequency") +
+    annotate("text", x = Inf, y = Inf, hjust = 1, vjust = 1, label = paste(fill_surv, ": Survivors\n", fill_dec, ": Deceased"), size = 4, color = "black") +
+    theme_minimal()
+}
+
+# Συνάρτηση για την εμφάνιση του ιστογράμματος FLC Group
+plot_flc_grp <- function(df) {
+  ggplot(df, aes(x = flc.grp)) +
+    geom_bar(fill = "skyblue") +
+    geom_text(stat = "count", aes(label = ..count..),
+              position = position_stack(vjust = 0.5), color = "black") +
+    labs(title = "Histogram of FLC Groups", x = "FLC Group", y = "Frequency") +
+    scale_x_continuous(breaks = 1:10) +
+    theme_minimal()
+}
+
+# Συνάρτηση για την εμφάνιση ποσοστού θνησιμότητας ανά ομάδα FLC
+plot_mortality_percentage <- function(df) {
+  mortality <- aggregate(death ~ flc.grp, data = df, FUN = function(x) sum(x) / length(x) * 100)
+  
+  ggplot(mortality, aes(x = flc.grp, y = death)) +
+    geom_bar(stat = "identity", fill = "skyblue") +
+    labs(title = "Mortality Percentage by FLC Group", x = "FLC Group", y = "Mortality Percentage") +
+    theme_minimal() +
+    scale_x_continuous(breaks = 1:10) +
+    geom_text(aes(label = sprintf("Group %d", flc.grp)), vjust = -0.5, size = 3)
+}
+
+# Συνάρτηση για την εμφάνιση σχέσης μεταξύ FLC Groups και MGUS
+plot_flc_mgus <- function(df) {
+  ggplot(df, aes(x = flc.grp, fill = factor(mgus))) +
+    geom_bar(position = "fill", alpha = 0.8) +
+    labs(title = "Σχέση μεταξύ των Ομάδων FLC και της Διάγνωσης MGUS",
+         x = "FLC Group", y = "Ποσοστό", fill = "MGUS Diagnosis") +
+    scale_y_continuous(labels = scales::percent) +
+    scale_x_continuous(breaks = 1:10) +
+    theme_minimal()
+}
+
+# Συνάρτηση για την εμφάνιση κατανομής των ομάδων FLC ανά φύλο
+plot_flc_gender <- function(df) {
+  ggplot(df, aes(x = flc.grp, fill = sex)) +
+    geom_bar(position = "fill", alpha = 0.8) +
+    labs(title = "Κατανομή των Ομάδων FLC ανά Φύλο",
+         x = "FLC Group", y = "Ποσοστό", fill = "Φύλο") +
+    scale_y_continuous(labels = scales::percent) +
+    scale_x_continuous(breaks = 1:10) +
+    theme_minimal()
+}
+
+# Συνάρτηση για την εμφάνιση αριθμού και ποσοστού λογοκριμένων παρατηρήσεων
+plot_censored <- function(df) {
+  count_death_0 <- sum(df$death == 0)
+  count_death_1 <- sum(df$death == 1)
+  
+  barplot(c(count_death_0, count_death_1), 
+          names.arg = c("Censored (0)", "Non-censored (1)"), 
+          ylab = "Number of observations",
+          main = "Censored vs Non-censored observations",
+          col = c("lightblue", "gray"),
+          border = "blue",
+          ylim = c(0, max(count_death_0, count_death_1) * 1.1)
+          )
+  
+ # Υπολογισμός του ποσοστού των αποκομμένων παρατηρήσεων στο σύνολο
+  percentage_censored <- (count_death_0 / nrow(df)) * 100
+  cat("Percentage of censored data: ", percentage_censored, "%\n")
+}
+```
+
+
+```{r}
+# Φόρτωση και προεπεξεργασία του dataset flchain
+mydata <- load_and_preprocess_data("flchain", "survival") # η συνάρτηση αφαιρεί τις τιμές του χρόνου που είναι 0                                                           
+
+# Εμφάνιση των πρώτων 10 γραμμών των δεδομένων
+head(mydata, 10)
+
+```
+
+```{r}
+# Σύνοψη δεδομένων
+summary(mydata)
+```
+
+```{r}
+# Εντοπισμός και εμφάνιση κενών τιμών
+missing_values_summary <- function(df) {
+  # Υπολογισμός του αριθμού των κενών τιμών για κάθε μεταβλητή
+  missing_summary <- sapply(df, function(x) sum(is.na(x)))
+  
+  # Δημιουργία ενός πίνακα με τα αποτελέσματα
+  missing_table <- data.frame(Variable = names(missing_summary), MissingCount = missing_summary)
+  
+  # Φιλτράρισμα για να εμφανιστούν μόνο οι μεταβλητές με κενές τιμές
+  missing_table <- missing_table[missing_table$MissingCount > 0, ]
+  
+  # Εκτύπωση των αποτελεσμάτων
+  if (nrow(missing_table) > 0) {
+    print(kable(missing_table, caption = "Αριθμός Κενών Τιμών ανά Μεταβλητή"))
+  } else {
+    print("Δεν υπάρχουν κενές τιμές στο dataset.")
+  }
+}
+
+# Εμφάνιση των κενών τιμών στο dataset
+missing_values_summary(mydata)
+
+```
+
+
+```{r}
+md.pattern(mydata)
+```
+
+```{r}
+# Δημιουργία αντίγραφου του αρχικού dataset για τροποποιήσεις
+modified_data <- mydata
+
+# Μετατροπή του chapter σε χαρακτήρα για την αντικατάσταση τιμών
+modified_data$chapter <- as.character(modified_data$chapter)
+
+# Αντικατάσταση των κενών τιμών στο chapter
+modified_data$chapter[is.na(modified_data$chapter) & modified_data$death == 0] <- "none"
+modified_data$chapter[is.na(modified_data$chapter) & modified_data$death == 1] <- "unknown"
+modified_data$chapter[modified_data$chapter == "" & modified_data$death == 0] <- "none"
+modified_data$chapter[modified_data$chapter == "" & modified_data$death == 1] <- "unknown"
+
+# Επιστροφή του chapter σε factor
+modified_data$chapter <- factor(modified_data$chapter)
+
+# Εμφάνιση των επιπέδων του chapter για επιβεβαίωση των αλλαγών
+levels(modified_data$chapter)
+
+# Συνάρτηση για ανάλυση κατηγορικών μεταβλητών συμπεριλαμβανομένων των κενών τιμών
+analyze_categorical_vars_0 <- function(mydata) {
+  # Βρίσκουμε τις κατηγορικές μεταβλητές
+  cat_vars <- names(mydata)[sapply(mydata, function(x) is.factor(x) || is.character(x))]
+  
+  # Λίστα για να αποθηκεύσουμε τα αποτελέσματα
+  cat_analysis <- list()
+  
+  # Επεξεργασία κάθε κατηγορικής μεταβλητής
+  for (var in cat_vars) {
+    # Προσθήκη του "Κενό" στα επίπεδα των παραγόντων
+    if (is.factor(mydata[[var]])) {
+      levels(mydata[[var]]) <- c(levels(mydata[[var]]), "Κενό")
+    }
+    
+    # Αντικατάσταση των κενών τιμών με "Κενό"
+    mydata[[var]][is.na(mydata[[var]])] <- "Κενό"
+    
+    # Υπολογισμός της συχνότητας και των ποσοστών
+    freq_table <- table(mydata[[var]])
+    prop_table <- prop.table(freq_table) * 100
+    
+    # Δημιουργία πίνακα αποτελεσμάτων
+    analysis <- data.frame(
+      Category = names(freq_table),
+      Frequency = as.vector(freq_table),
+      Percentage = as.vector(prop_table)
+    )
+    
+    # Αποθήκευση αποτελεσμάτων στη λίστα
+    cat_analysis[[var]] <- analysis
+  }
+  
+  return(cat_analysis)
+}
+
+# Χρήση της συνάρτησης analyze_categorical_vars_0 στο modified_data
+results <- analyze_categorical_vars_0(modified_data)
+print(results)
+
+
+```
+
+```{r}
+#αντικασταση
+mydata$chapter<-modified_data$chapter
+sum(is.na(mydata$chapter))
+```
+
+
+#Μέθοδος: Αντικατάσταση με MICE
+```{r}
+# Εφαρμογή της μεθόδου multiple imputation
+imputed_data <- mice(mydata, method = "pmm", m = 5, maxit = 50, seed = 500)
+
+# Αντικατάσταση των κενών τιμών με τις προβλεπόμενες
+completed_data <- complete(imputed_data, action = 1)
+
+# Έλεγχος για τυχόν εναπομείναντα κενά
+missing_values_summary(completed_data)
+
+
+
+
+#Η mice συνάρτηση εκτελεί την πολλαπλή παρεμβολή χρησιμοποιώντας Predictive Mean Matching #για τις συνεχείς μεταβλητές.
+#Ορίζουμε m = 5 για να δημιουργήσουμε 5 συμπληρώσεις και maxit = 50 για να επιτρέψουμε έως και 50 επαναλήψεις για σύγκλιση.
+#Η παράμετρος seed = 500 εξασφαλίζει την αναπαραγωγιμότητα των αποτελεσμάτων.
+#Ολοκλήρωση και Έλεγχος:
+#Η complete συνάρτηση παράγει το τελικό dataset με τις συμπληρωμένες τιμές.
+
+```
+
+
+#Ανάλυση και Γραφήματα 
+
+
+#Οπτικοποιηση δεδομένων 
+```{r}
+# Εμφάνιση ποσοστών ανδρών και γυναικών
+plot_gender_distribution(completed_data)
+
+```
+
+```{r}
+# Γράφημα 1: Κατανομή ηλικίας (age)
+
+mean_age <- mean(completed_data$age)
+
+ggplot(completed_data, aes(x = age)) +
+  geom_histogram(binwidth = 5, fill = "skyblue", color = "black", alpha = 0.7) +
+  geom_vline(aes(xintercept = mean_age), color = "black", linetype = "dashed", size = 1) +
+  annotate("text", x = mean_age + 5, y = max(table(completed_data$age)) * 0.9, 
+           label = paste("Μέση Ηλικία:", round(mean_age, 2)), color = "black") +
+  labs(title = "Κατανομή Ηλικίας με Μέση Τιμή", x = "Ηλικία", y = "Συχνότητα") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10))
+```
+```{r}
+unique_levels <- unique (completed_data$flc.grp )
+unique_levels <- sort ( unique_levels )
+print ( unique_levels )
+
+
+```
+
+
+```{r}
+# Ιστόγραμμα της μεταβλητής FLC Group
+plot_flc_grp(completed_data)
+
+```
+
+
+
+
+```{r}
+# Σχέση μεταξύ των Ομάδων FLC και της Διάγνωσης MGUS
+plot_flc_mgus(mydata)
+
+```
+
+
+
+
+```{r}
+# Αριθμός και ποσοστό λογοκριμένων παρατηρήσεων
+plot_censored(completed_data)
+
+```
+
+
+
+#Ερώτημα 2: Έχουμε δυο κατηγορικές μεταβλητές την μεταβλητή Sex (φύλο) με δύο κατηφορίες: F= γυναίκες και M= αντρες, και τη μεταβλητή Mgus, η οποία φορά τη Διάγνωση MGUS με κατηγορίες 0 : όσους δεν νοσούν και 1 : όσους νοσούν. 
+Θα μελετήσουμε το χρόνο επιβίωσης για τις ομάδες γυναίκες, άντρες και στη συνέχεια τις ομάδες Mgus: 0 και Mgus:1
+
+
+```{r}
+km.as.one <- survfit(Surv(completed_data$futime/365,completed_data$death)~ 1, data = completed_data )
+summary ( km.as.one )
+ggsurvplot ( km.as.one , data = completed_data,ylim=c(0.65,1))
+
+```
+
+
+Παρακάτω υλοποιούμε το logrank test για την κατηγορική μεταβλητή φύλο. 
+
+```{r}
+
+# Δημιουργία του survival object για τη μεταβλητή 'sex'
+surv_object_sex <- Surv(completed_data$futime/365,completed_data$death)
+
+km_1 <- survfit( surv_object_sex ~ completed_data$sex, data =completed_data,conf.type = "log-log") 
+
+logrank_test <- survdiff(surv_object_sex ~ sex, data = completed_data, rho=0)
+print(logrank_test)
+```
+
+
+```{r}
+# Δημιουργία του survival object για τη μεταβλητή 'Mgus'
+surv_object_mgus <- Surv(time = completed_data$futime/365, event = completed_data$death)
+
+km_2 <- survfit(surv_object_mgus ~ mgus, data = completed_data)
+logrank_test <- survdiff(surv_object_mgus ~ mgus, data = completed_data, rho=0)
+print(logrank_test)
+
+```
+
+
+```{r}
+library(numDeriv)
+
+#mean minitab 13308,9
+likelihood_exponential <- function(lambda){
+  log_likelihood <- sum(completed_data$death)*log(lambda)-lambda*sum(completed_data$futime)
+  return(-log_likelihood)}
+
+optim(1/13300,likelihood_exponential)
+
+#εκτίμιση της μεσης τιμής: 1/λ 
+1/7.512923e-05
+```
+
+#ΜΕΡΟΣ 2
+Fit a Proportional Hazards regression model (Cox model) using all the available covariates. Interpret the results (Which covariates seem to be significantly important? How do they influence the hazard function?
+
+```{r}
+cmx<- coxph ( Surv ( completed_data$futime ,completed_data$death ) ~. , data=completed_data,control = coxph.control(iter.max = 1000))
+summary ( cmx)
+
+```
+
+```{r}
+# Δημιουργία του γραφήματος
+ggforest(cmx, data = completed_data)
+
+```
+
+
+
+##Find the `best' model using the Forward selection or/and the Backward elimination techniques. Interpret the results.
+
+
+
+##Forward selection :
+```{r}
+# Εκτέλεση 
+fit0_mean = coxph(Surv(completed_data$futime,completed_data$death) ~ 1, data=completed_data)
+# (starting model)
+fitf_mean = stepAIC(fit0_mean, scope=formula(cmx), direction="forward", k=2)
+summary(fitf_mean)
+```
+
+
+
+##Backward elimination: 
+```{r}
+cmx_back = stepAIC(cmx, direction="backward", k=2)
+summary(cmx_back)
+```
+
+
+
+##Stepwise selection
+```{r}
+# Stepwise selection using AIC
+fits_mean = stepAIC(cmx, direction="both", k=2)
+summary(fits_mean)
+```
+
+
+Teliko montelo
+```{r}
+final_cmx <- coxph(formula = Surv(completed_data$futime, completed_data$death) ~ age + sample.yr + lambda + flc.grp + creatinine + chapter, data = completed_data)
+summary(final_cmx)
+```
+
+
+#Test the proportional hazard assumption (using statistical tests and graphical diagnostics)
+ελεγχος-mean
+```{r}
+# test for the proportional-hazards (PH) assumption
+test.ph <- cox.zph(final_cmx) 
+test.ph
+```
+
+
+
+Αντιμετώπιση παραβιασης της υπόθεσης αναλογικής διακινδύνευσης 
+Η παραβίαση της υπόθεσης της αναλογικότητας της διακινδύνευσης μπορεί πιθανά να αντιμετωπιστεί με την επανακωδικοποίηση κάποιων συμμεταβλητών
+
+## Επανακωδικοποιηση 
+εχω προβλημα με τις: sample.yr,lambda ,flc.grp,chapter    
+
+
+```{r}
+completed_data$sample.yr_grp <- as.factor(ifelse(completed_data$sample.yr<=1997,'A1','B1'))
+
+```
+
+```{r}
+# Δημιουργία λίστας με τις 2 ομάδες 
+groups <- list(
+  Other = c("Injury and Poisoning", "External Causes", "Genitourinary", 
+            "Ill Defined", "Infectious", "Blood", "Endocrine", 
+            "Musculoskeletal", "Skin"),
+  None = c("None")
+)
+
+# Επανακωδικοποίηση της μεταβλητής chapter σε ομάδες βάσει των κυρίων αιτιών θανάτου
+completed_data$chapter_2group <- factor(
+  sapply(completed_data$chapter, function(x) {
+    for (group in names(groups)) {
+      if (x %in% groups[[group]]) {
+        return(group)
+      }
+    }
+  }), levels = names(groups)
+)
+```
+
+```{r}
+completed_data$flc.grp_gr <- as.factor(ifelse(completed_data$flc.grp<=5,'A3','B3'))
+```
+
+
+```{r}
+completed_data$age_gr <- as.factor(ifelse(completed_data$age <=64, 'A4', 'B4'))
+
+```
+
+
+```{r}
+# Summary statistics for lambda
+summary(completed_data$lambda)
+# Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.040   1.200   1.510   1.702   1.920  26.600 
+
+# Define the breaks based on the summary statistics
+breaks <- c(0.040, 1.200, 1.510, 1.920, 26.600)
+
+# Use the cut function to create the groups
+completed_data$lambda_grp <- cut(completed_data$lambda, 
+                       breaks = breaks, 
+                       labels = c('A2', 'B2', 'C2', 'D2'), 
+                       include.lowest = TRUE)
+
+# Convert the result to a factor
+completed_data$lambda_grp_0 <- as.factor(completed_data$lambda_grp)
+
+# Check the resulting factor levels
+table(completed_data$lambda_grp)
+
+```
+
+
+```{r}
+#  Δημιουργία του μοντέλου Cox με τις αλληλεπιδράσεις
+cmx_interaction_01 <- coxph(Surv(futime, death) ~ age_gr + sample.yr_grp + lambda_grp_0+ flc.grp_gr + creatinine + chapter_2group, data = completed_data)
+
+# Έλεγχος αναλογικότητας των κινδύνων
+test.ph_interaction <- cox.zph(cmx_interaction_01)
+print(test.ph_interaction)
+
+```
+
+#Τελικ0 μοντελ0 και  influential observations
+
+Τα DFBETA residuals είναι μετρήσεις που δείχνουν την επίδραση κάθε παρατήρησης στις εκτιμήσεις των παραμέτρων του μοντέλου Cox. Μεγάλες τιμές DFBETA υποδεικνύουν παρατηρήσεις που έχουν σημαντική επιρροή στις παραμέτρους του μοντέλου. Η τυπική κατώτατη τιμή για τον εντοπισμό των influential παρατηρήσεων είναι 5/√n, όπου n είναι ο αριθμός των παρατηρήσεων
+
+##τελικο μοντέλο 
+```{r}
+cmx_final <- coxph(Surv(futime, death) ~ age_gr + sample.yr_grp + lambda_grp_0+ flc.grp_gr + creatinine + chapter_2group, data = completed_data)
+```
+
+
+```{r}
+# Έλεγχος για το μοντέλο με mean imputation
+dfbeta<- residuals(cmx_final, type = "dfbeta")
+
+# Εμφάνιση των πρώτων γραμμών του dfbeta_mean για επιβεβαίωση των ονομάτων
+head(dfbeta)
+
+```
+
+```{r}
+# Υπολογισμός των DFBETA
+dfbeta <- residuals(cmx_final, type = "dfbeta")
+
+# Γραφική απεικόνιση των DFBETA
+ggcoxdiagnostics(cmx_final, type = "dfbeta", linear.predictions = FALSE)
+
+# Εντοπισμός των influential παρατηρήσεων (DFBETA > 5/ sqrt(n))
+n <- nrow(completed_data)
+threshold <- 5/ sqrt(n) 
+# Χρησιμοποιούμε το κλασικό όριο 5/sqrt(n)
+# Αναγνώριση των influential observations για το completed_data
+influential <- which(apply(dfbeta, 1, function(x) any(abs(x) > threshold)))
+influential_observations<- completed_data[influential, ]
+
+
+# Προβολή των αποτελεσμάτων
+print("Influential Observations for completed_data:")
+print(influential_observations)
+
+
+```
+
+
+
+
+
+
+
