@@ -1,0 +1,1 @@
+Analyzed survival data with multiple covariates, performing descriptive statistics and Kaplan-Meier estimator comparisons. Conducted log-rank tests, graphical goodness-of-fit tests, and MLE calculations using R. Fitted a Proportional Hazards regression model (Cox model) and tested its assumptions.
